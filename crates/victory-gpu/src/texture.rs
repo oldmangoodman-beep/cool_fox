@@ -869,7 +869,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         list.defer_host(move || noted.note_held());
         return;
     };
-    list.defer_texture(staging.clone());
+    list.defer_texture_ready(staging.clone());
     list.defer_host(move || {
         let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
         staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
@@ -1438,7 +1438,10 @@ impl Staging {
         if read {
             UNLOCKED[0].fetch_add(1, Relaxed);
             size
-        } else if last.hash.is_none() && fill_unlocked() {
+        } else if last.hash.is_none() && (fill_unlocked() || self.on_demand) {
+            // Unmapped mip levels are expected in a sparse texture. Its
+            // first upload must fill the mapped pages even when ordinary
+            // committed textures wait for a complete source snapshot.
             self.fill(last, size)
         } else {
             UNLOCKED[1].fetch_add(1, Relaxed);

@@ -2155,7 +2155,7 @@ fn rehash_runs() -> bool {
 /// Since the last frame-rate line, of our own passes over copies in the
 /// card's memory: hash passes after ranges were sent up, the pieces they
 /// hashed, and compare passes after the lists.
-static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+static CARD_PASSES: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// Whether what shaders wrote to copies in the card's memory is merged
 /// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
@@ -2184,6 +2184,243 @@ struct CardRange {
     /// Looked at by `crate::picked`, and not declared: what is found changed
     /// there was written through a view nobody declared. Not landed.
     picked: bool,
+}
+
+/// One checksum dispatch. Disjoint declared byte ranges may occupy the same
+/// 64 KiB piece; all of them must see the same comparison result before a
+/// relay compare updates that piece's baseline hash.
+struct CardCompareRun {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    span: crate::shadow::CardSpan,
+    at: u32,
+    picked: bool,
+}
+
+fn compact_card_compares(ranges: &mut [CardRange], first_result: u32) -> (Vec<CardCompareRun>, u32) {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut by_copy = std::collections::HashMap::<usize, usize,
+        std::hash::BuildHasherDefault<AddressHash>>::default();
+    for (i, range) in ranges.iter().enumerate().filter(|(_, range)| range.compared) {
+        // Shadow is aligned; retain the distinction between observed ranges
+        // and declared writes, whose baseline hashes may be updated.
+        let key = std::sync::Arc::as_ptr(&range.shadow) as usize | usize::from(range.picked);
+        let group = *by_copy.entry(key).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[group].push(i);
+    }
+    let mut runs = Vec::new();
+    let mut at = first_result;
+    for group in groups {
+        let first = runs.len();
+        let spans = crate::shadow::joined_piece_runs(group.iter().map(|&i| ranges[i].span).collect());
+        for span in spans {
+            let range = &ranges[group[0]];
+            runs.push(CardCompareRun { shadow: range.shadow.clone(), span, at, picked: range.picked });
+            at += span.pieces;
+        }
+        for i in group {
+            let range = &mut ranges[i];
+            let joined = &runs[first..];
+            let run = &joined[joined.partition_point(|run| run.span.first <= range.span.first) - 1];
+            debug_assert!(range.span.first + range.span.pieces <= run.span.first + run.span.pieces);
+            range.at = run.at + range.span.first - run.span.first;
+        }
+    }
+    (runs, at)
+}
+
+#[cfg(test)]
+mod compare_coalescing_tests {
+    use super::*;
+
+    fn shadow(start: u64) -> std::sync::Arc<crate::shadow::Shadow> {
+        crate::shadow::Shadow::unbacked(start, std::ptr::null_mut(), 4 * 65536, false)
+    }
+
+    fn range(shadow: &std::sync::Arc<crate::shadow::Shadow>, from: usize, to: usize, picked: bool, compared: bool) -> CardRange {
+        CardRange { shadow: shadow.clone(), declared: (from, to),
+            span: shadow.card_run(from, to), at: u32::MAX, compared, picked }
+    }
+
+    #[test]
+    fn shared_piece_flags_preserve_declared_bytes_modes_and_copies() {
+        let a = shadow(0x7a10_0000);
+        let b = shadow(0x7b10_0000);
+        let mut ranges = vec![
+            range(&a, 64, 80, false, true),
+            range(&a, 4096, 4112, false, true),
+            range(&a, 65536 + 128, 65536 + 144, false, true),
+            range(&a, 3 * 65536 + 64, 3 * 65536 + 80, false, true),
+            range(&b, 64, 80, false, true),
+            range(&a, 64, 80, true, true),
+            range(&a, 2 * 65536, 2 * 65536 + 16, false, false),
+        ];
+        let before: Vec<_> = ranges.iter().map(|r| (r.declared, r.span)).collect();
+        let (runs, end) = compact_card_compares(&mut ranges, 17);
+        assert_eq!(runs.len(), 4);
+        assert_eq!(end, 22);
+        assert_eq!(ranges[0].at, ranges[1].at);
+        assert_eq!(ranges[2].at, ranges[0].at + 1);
+        assert_ne!(ranges[4].at, ranges[0].at, "different copies keep separate flags");
+        assert_ne!(ranges[5].at, ranges[0].at, "observations keep separate baseline semantics");
+        assert_eq!(ranges[6].at, u32::MAX, "uncompared ranges still use unconditional readback");
+        assert_eq!(ranges.iter().map(|r| (r.declared, r.span)).collect::<Vec<_>>(), before);
+        assert!(!runs.iter().filter(|r| std::sync::Arc::ptr_eq(&r.shadow, &a) && !r.picked)
+            .any(|r| r.span.first <= 2 && 2 < r.span.first + r.span.pieces), "no undeclared piece is added");
+        assert_eq!(compact_card_compares(&mut [], 29).1, 29);
+    }
+
+    /// The relay updates a checksum's baseline as it compares. Two byte
+    /// ranges in one piece must both see its first changed flag, rather than
+    /// the second range comparing against the baseline just updated by the first.
+    #[test]
+    fn relay_compare_shares_changed_flags_and_updates_the_baseline_once() {
+        let host = host().expect("real D3D12 device required");
+        let work = host.make_card_work().unwrap();
+        let (source, data) = host.upload_buffer(65536).unwrap();
+        let hashes = host.uav_buffer(256).unwrap();
+        let readback = host.read_back_buffer(256).unwrap();
+        // SAFETY: upload buffer mapped for the test's lifetime.
+        unsafe { std::ptr::write_bytes(data, 0, 65536); }
+        let a = shadow(0x7c10_0000);
+        let mut ranges = vec![range(&a, 64, 80, false, true), range(&a, 4096, 4112, false, true)];
+        let (runs, end) = compact_card_compares(&mut ranges, 0);
+        assert_eq!(end, 1);
+        let execute = |mode: u32| {
+            let list = host.new_list().unwrap();
+            // SAFETY: live resources and an open list; the compiled root signature.
+            unsafe {
+                list.list.SetComputeRootSignature(&work.root);
+                list.list.SetPipelineState(&work.pso);
+                list.list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
+                list.list.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
+                list.list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                if mode == 0 {
+                    list.list.ResourceBarrier(&[
+                        transition(&hashes, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                        transition(&work.differs.0, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                    ]);
+                }
+                list.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }) }, ..Default::default()
+                }]);
+                for run in &runs { card_pass(&list.list, &run.span, 65536, run.at, mode); }
+                list.list.ResourceBarrier(&[transition(&work.differs.0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.list.CopyBufferRegion(&readback, 0, &work.differs.0, 0, 4);
+                list.list.ResourceBarrier(&[transition(&work.differs.0, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+                list.list.Close().unwrap();
+            }
+            host.execute_sync_internal(&list);
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: completed GPU readback.
+            unsafe {
+                readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 4 }), Some(&mut mapped)).unwrap();
+                let flag = mapped.cast::<u32>().read();
+                readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+                flag
+            }
+        };
+        execute(0);
+        // Both disjoint declared ranges are changed after the baseline ran.
+        unsafe { data.add(68).write(0x5a); data.add(4100).write(0xa5); }
+        assert!(torn::flagged(execute(2)));
+        assert_eq!(ranges[0].at, ranges[1].at);
+        assert!(!torn::flagged(execute(2)), "baseline was updated for the next submission");
+        // Every byte of a piece participates, including a byte outside the
+        // declared ranges. Readback bounds remain the original byte ranges.
+        unsafe { data.add(60000).write(0x44); }
+        assert!(torn::flagged(execute(2)));
+        assert_eq!(ranges[0].declared, (64, 80));
+        assert_eq!(ranges[1].declared, (4096, 4112));
+        unsafe { assert!(host.device.GetDeviceRemovedReason().is_ok()); }
+    }
+
+    #[test]
+    #[ignore = "GPU timing benchmark; run explicitly without the game"]
+    fn checksum_coalescing_cost() {
+        let host = host().expect("real D3D12 device required");
+        let work = host.make_card_work().unwrap();
+        const SIZE: u32 = 64 << 20;
+        const DECLARATIONS: usize = 4096;
+        let (upload, data) = host.upload_buffer(u64::from(SIZE)).unwrap();
+        let source = host.uav_buffer(u64::from(SIZE)).unwrap();
+        let hashes = host.uav_buffer(u64::from(SIZE / 65536) * 16).unwrap();
+        let back = host.read_back_buffer(256).unwrap();
+        let mut stamps: Option<ID3D12QueryHeap> = None;
+        unsafe { host.device.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC {
+            Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2, ..Default::default()
+        }, &mut stamps).unwrap(); }
+        let stamps = stamps.unwrap();
+        unsafe { std::ptr::write_bytes(data, 0x5a, SIZE as usize); }
+        let fill = host.new_list().unwrap();
+        unsafe {
+            fill.list.ResourceBarrier(&[transition(&source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            fill.list.CopyBufferRegion(&source, 0, &upload, 0, u64::from(SIZE));
+            fill.list.ResourceBarrier(&[transition(&source, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+            fill.list.Close().unwrap();
+        }
+        host.execute_sync_internal(&fill);
+        let a = crate::shadow::Shadow::unbacked(0x7d10_0000, std::ptr::null_mut(), u64::from(SIZE), false);
+        let mut ranges: Vec<_> = (0..DECLARATIONS).map(|i| {
+            let from = i / 4 * 65536 + i % 4 * 256;
+            range(&a, from, from + 16, false, true)
+        }).collect();
+        let original: Vec<_> = ranges.iter().enumerate().map(|(i, r)| CardCompareRun {
+            shadow: a.clone(), span: r.span, at: i as u32, picked: false,
+        }).collect();
+        let (joined, _) = compact_card_compares(&mut ranges, 0);
+        let frequency = unsafe { host.queue.GetTimestampFrequency() }.unwrap();
+        let measure = |runs: &[CardCompareRun], initialize: bool| {
+            let list = host.new_list().unwrap();
+            unsafe {
+                if initialize {
+                    list.list.ResourceBarrier(&[
+                        transition(&hashes, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                        transition(&work.differs.0, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                    ]);
+                }
+                list.list.SetComputeRootSignature(&work.root);
+                list.list.SetPipelineState(&work.pso);
+                list.list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
+                list.list.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
+                list.list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                list.list.EndQuery(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                for run in runs { card_pass(&list.list, &run.span, SIZE, run.at, 1); }
+                list.list.EndQuery(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                list.list.ResolveQueryData(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &back, 0);
+                list.list.Close().unwrap();
+            }
+            host.execute_sync_internal(&list);
+            let mut data = std::ptr::null_mut();
+            unsafe {
+                back.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 16 }), Some(&mut data)).unwrap();
+                let ticks = std::slice::from_raw_parts(data.cast::<u64>(), 2);
+                let elapsed = ticks[1].saturating_sub(ticks[0]) as f64 * 1000.0 / frequency as f64;
+                back.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+                elapsed
+            }
+        };
+        measure(&original, true);
+        measure(&joined, false);
+        let mut old = Vec::new();
+        let mut new = Vec::new();
+        for i in 0..9 {
+            if i % 2 == 0 {
+                old.push(measure(&original, false)); new.push(measure(&joined, false));
+            } else {
+                new.push(measure(&joined, false)); old.push(measure(&original, false));
+            }
+        }
+        old.sort_by(f64::total_cmp); new.sort_by(f64::total_cmp);
+        eprintln!("synthetic 64 MiB GPU checksum benchmark: {} -> {} dispatches, {:.4} -> {:.4} ms (median); this is not a full frame measurement",
+            original.len(), joined.len(), old[4], new[4]);
+        unsafe { assert!(host.device.GetDeviceRemovedReason().is_ok()); }
+    }
 }
 
 impl CardPlan {
@@ -2241,6 +2478,9 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// A sparse upload consumes the staging buffer's held-mip mask in the
+    /// next step. Complete this refresh before that metadata is read.
+    TextureReady(std::sync::Arc<crate::texture::Staging>),
     /// Reads a CPU-written linear movie plane into a per-list upload buffer.
     Plane((usize, usize), Box<dyn Fn() + Send>),
     /// A title buffer copy that the list does on the card ([`place`]): what
@@ -2990,7 +3230,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging) | Step::TextureReady(staging) => {
                     let (at, len) = staging.memory();
                     if touches(written, at, at + len) {
                         if count {
@@ -4418,6 +4658,7 @@ impl Host {
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
         let mut at = work.taken;
+        let first_result = at;
         for (shadow, ranges) in &declared {
             let mut sorted = ranges.clone();
             sorted.sort_unstable();
@@ -4464,6 +4705,12 @@ impl Host {
                 at += span.pieces;
             }
         }
+        // Keep each declared byte range for readback, sharing flags only for
+        // identical pieces of the same copy and the same comparison mode.
+        CARD_PASSES[3].fetch_add(plan.ranges.iter().filter(|r| r.compared).count() as u64, Ordering::Relaxed);
+        CARD_PASSES[4].fetch_add(plan.ranges.iter().filter(|r| r.compared).map(|r| u64::from(r.span.pieces)).sum(), Ordering::Relaxed);
+        let (compare_runs, at) = compact_card_compares(&mut plan.ranges, first_result);
+        CARD_PASSES[5].fetch_add(compare_runs.iter().map(|r| u64::from(r.span.pieces)).sum(), Ordering::Relaxed);
         work.taken = at;
         if plan.ranges.iter().any(|r| r.compared) {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
@@ -4490,7 +4737,7 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
+                    for r in &compare_runs {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
                         };
@@ -7296,6 +7543,10 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
+    pub(crate) fn defer_texture_ready(&self, staging: std::sync::Arc<crate::texture::Staging>) {
+        self.deferred().copies.push(Step::TextureReady(staging));
+    }
+
     /// A copy source owned exclusively by this list until reset after its
     /// last execution. A different list can prepare its movie plane concurrently.
     pub(crate) fn plane_upload(
@@ -7440,6 +7691,15 @@ impl HostList {
                         if !wide_textures() {
                             batch.refresh_textures();
                         }
+                    }
+                    continue;
+                }
+                Step::TextureReady(staging) => {
+                    // Sparse tile mappings must consume the mip mask from
+                    // this refresh, rather than the preceding submission.
+                    batch.refresh_textures();
+                    if batch.texture_due(staging) {
+                        staging.refresh();
                     }
                     continue;
                 }
@@ -8998,11 +9258,13 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         split_line(frames);
         {
-            let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [passes, pieces, compares, original_compares, original_pieces, compare_pieces] =
+                [0, 1, 2, 3, 4, 5].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + compares > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
+                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes \
+                     over {compare_pieces:.0} pieces (before coalescing: {original_compares:.0} passes over {original_pieces:.0} pieces)",
                     if rehash_runs() { "on" } else { "off" }
                 );
             }
