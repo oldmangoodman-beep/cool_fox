@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-if not defined VICTORY_GAME_DIR set "VICTORY_GAME_DIR=C:\Users\Léo\Downloads\GTA\GTA6.Xbox.v1.0.2.1-CYBERLEEK"
+if not defined VICTORY_GAME_DIR set "VICTORY_GAME_DIR=%USERPROFILE%\Downloads\GTA\GTA6.Xbox.v1.0.2.1-CYBERLEEK"
 set "runner=%~dp0target\release\victory.exe"
 if not exist "%runner%" set "runner=%~dp0victory-3d-rtx-pareto-residency.exe"
 
@@ -19,10 +19,12 @@ set "VICTORY_INDIRECT_BATCH=2"
 set "VICTORY_MAP_THREADS=1"
 set "VICTORY_CARD_AWAKE=1"
 set "VICTORY_SHOW_AFTER=1"
-set "VICTORY_THIN=1"
-set "VICTORY_JOIN_PARTS=8"
-if not defined VICTORY_PORT_CONSTANTS set "VICTORY_PORT_CONSTANTS=1"
-if not defined VICTORY_PORT_CBV set "VICTORY_PORT_CBV=1"
+if not defined VICTORY_THIN set "VICTORY_THIN=0"
+if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=0"
+if not defined VICTORY_LIBRARY_STORE_LATER set "VICTORY_LIBRARY_STORE_LATER=1"
+if not defined VICTORY_PIPELINE_WAIT_MS set "VICTORY_PIPELINE_WAIT_MS=0"
+if not defined VICTORY_PORT_CONSTANTS set "VICTORY_PORT_CONSTANTS=0"
+if not defined VICTORY_PORT_CBV set "VICTORY_PORT_CBV=0"
 if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"
 set "VICTORY_LEVELS_ON_DEMAND=1"
 
