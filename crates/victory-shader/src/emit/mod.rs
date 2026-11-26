@@ -126,6 +126,14 @@ pub use shader::{
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
+/// Whether programs that reach memory by address (ray tracing and what
+/// builds its structures) translate: `VICTORY_RAYS=1`.
+// shortcut: off until they run without stopping the host GPU.
+pub fn rays() -> bool {
+    static RAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *RAYS.get_or_init(|| cfg!(test) || std::env::var("VICTORY_RAYS").is_ok_and(|v| v == "1"))
+}
+
 /// The stack for threads that make host pipelines from translated shaders.
 /// vkd3d-proton converts DXIL on the calling thread, recursively over its
 /// control flow: a large traversal program (the ray-tracing shadow passes)
