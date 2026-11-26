@@ -2080,6 +2080,16 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// Every caller uses it at once, within the title's call.
 /// Called before a submission starts, by the thread that submits.
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
+#[cfg(any(windows, test))]
+fn sweep_batch(all: &std::collections::BTreeSet<usize>, from: usize, limit: usize) -> impl Iterator<Item = usize> + '_ {
+    // The last batch can end exactly at the final address, or the
+    // remaining textures can be released between passes. A cursor with
+    // nothing after it starts again at the first address.
+    let tail = all.range(from..);
+    let batch = if from != 0 && tail.clone().next().is_none() { all.range(..) } else { tail };
+    batch.take(limit).copied()
+}
+
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
@@ -2146,7 +2156,7 @@ pub(crate) fn let_go_idle() {
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
     let began = std::time::Instant::now();
-    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
+    for at in sweep_batch(&all, from, part).chain(by_age.iter().map(|&(_, at)| at)) {
         if bytes >= most {
             break;
         }
@@ -4735,6 +4745,23 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn idle_sweep_restarts_after_a_full_last_batch() {
+        let all = std::collections::BTreeSet::from([1, 3, 5, 7]);
+        assert_eq!(super::sweep_batch(&all, 0, 2).collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(super::sweep_batch(&all, 4, 2).collect::<Vec<_>>(), [5, 7]);
+        assert_eq!(super::sweep_batch(&all, 8, 2).collect::<Vec<_>>(), [1, 3]);
+    }
+
+    #[test]
+    fn idle_sweep_restarts_if_the_remaining_textures_were_released() {
+        let mut all = std::collections::BTreeSet::from([1, 3, 5]);
+        assert_eq!(super::sweep_batch(&all, 0, 2).collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(super::sweep_batch(&all, 4, 2).collect::<Vec<_>>(), [5]);
+        all.remove(&5);
+        assert_eq!(super::sweep_batch(&all, 4, 2).collect::<Vec<_>>(), [1, 3]);
     }
 
     #[test]
