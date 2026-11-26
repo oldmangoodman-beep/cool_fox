@@ -186,6 +186,9 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && kind & MEM_RESERVE_PLACEHOLDER != 0 && constrained && flags & ADDRESS_32BIT != 0 {
         LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
     }
+    if !at.is_null() && placeholder {
+        victory_gpu::title_placeholder_reserved(at as usize, size);
+    }
     note_protection(asked, kind, flags, at as usize, size);
     at
 }

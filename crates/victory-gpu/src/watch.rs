@@ -2072,7 +2072,47 @@ fn placeholder(block: usize) -> bool {
             std::ptr::null_mut(),
         )
     };
-    status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0
+    if status >= 0 {
+        return region.region_type & PLACEHOLDER_RESERVATION != 0;
+    }
+    // Wine has no class 7 (and its class 6 says no kind): what the runtime
+    // reserved as placeholders for the title answers instead. Asked of Wine,
+    // no hole was ever known and every asking put a question to it for each
+    // of its holes, 12,900 a frame while the world streamed in; each one
+    // walks Wine's page table to the end of the reservation under its one
+    // lock, behind which the title's mapping and our guards' faults waited
+    // (frames of 0.5 to 6 s, 2026-11-26).
+    let at = block * BLOCK;
+    PLACEHOLDERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(..=at)
+        .next_back()
+        .is_some_and(|(_, end)| at < *end)
+}
+
+/// The placeholder reservations the runtime made for the title, start to end
+/// (for [`placeholder`] where the host cannot tell).
+static PLACEHOLDERS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// The runtime reserved `[at, at + len)` for the title as a placeholder,
+/// into which only views (or allocations) come.
+pub fn title_placeholder_reserved(at: usize, len: usize) {
+    if len != 0 {
+        PLACEHOLDERS.lock().unwrap_or_else(|e| e.into_inner()).insert(at, at.saturating_add(len));
+    }
+}
+
+/// The title frees `[at, at + len)` (no length: the allocation at `at`):
+/// no placeholder reservation there is known any more. One cut more than
+/// that is only asked of the host again.
+fn placeholders_freed(at: usize, len: usize) {
+    let end = if len == 0 { at + 1 } else { at.saturating_add(len) };
+    let mut p = PLACEHOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+    let gone: Vec<usize> = p.range(..end).filter(|(_, e)| **e > at).map(|(s, _)| *s).collect();
+    for start in gone {
+        p.remove(&start);
+    }
 }
 
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
@@ -3657,6 +3697,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    placeholders_freed(at, len);
     if len != 0 {
         forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     } else if VIEWS.any(at / BLOCK, at / BLOCK + 1) {
