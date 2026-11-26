@@ -45,6 +45,7 @@ use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
+use crate::descriptor::host::TextureRecheck;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -876,6 +877,15 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+
+fn next_texture_recheck(unchanged_looks: u8, changed_in_place: bool) -> Option<(u8, u64)> {
+    let next = usize::from(unchanged_looks) + 1;
+    if let Some(&wait) = RECHECK_FRAMES.get(next) {
+        Some((next as u8, wait))
+    } else {
+        changed_in_place.then_some((unchanged_looks, RECHECK_FRAMES[RECHECK_FRAMES.len() - 1]))
+    }
+}
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
@@ -2858,6 +2868,8 @@ impl State {
             // it. The host copy then kept what the memory held at the
             // first look for the rest of the run. The look reads 48 KiB;
             // only a changed texture is uploaded again.
+            // Once a texture has changed without a notice, keep checking
+            // it at the longest interval after the initial checks end.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             // One found changed by such a look is looked at in the next frame
             // again: the textures left that change unnoticed are ones the
@@ -2865,17 +2877,22 @@ impl State {
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
-            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+            let mut changed_in_place = false;
+            if let Some(mut checked) = host.texture_slot_checked(index, write) {
+                let TextureRecheck { address: at, bytes: len, fingerprint, unchanged_looks, uploaded, .. } =
+                    checked;
+                if crate::texture::fingerprint(at, len) == fingerprint {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+                    match next_texture_recheck(unchanged_looks, checked.changed_in_place) {
+                        Some((looks, wait)) => {
+                            checked.unchanged_looks = looks;
+                            host.texture_slot_recheck(index, write, frame + wait, checked);
                         }
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
                 }
+                changed_in_place = true;
                 if recheck_soon() {
                     again_in = 1;
                 }
@@ -2895,12 +2912,27 @@ impl State {
                         address = format_args!("{at:#x}"),
                         bytes = len,
                         frames_after_upload = frame.saturating_sub(uploaded),
-                        looks,
+                        looks = unchanged_looks,
                         changed = n + 1,
                         "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
                     );
                 }
             }
+            let schedule_recheck = |address, bytes| {
+                host.texture_slot_recheck(
+                    index,
+                    write,
+                    frame + again_in,
+                    TextureRecheck {
+                        address,
+                        bytes,
+                        fingerprint: crate::texture::fingerprint(address, bytes),
+                        unchanged_looks: 0,
+                        uploaded: frame,
+                        changed_in_place,
+                    },
+                );
+            };
             let mut partly = None;
             let mut there = None;
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
@@ -3076,10 +3108,7 @@ impl State {
                 let again = partly.map(|mapped| (frame + 1, mapped));
                 let memory = if again.is_none() && heap_recheck() { crate::texture::title_span(resource, first) } else { None };
                 match memory {
-                    Some((at, len)) => {
-                        let print = crate::texture::fingerprint(at, len);
-                        host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
-                    }
+                    Some((at, len)) => schedule_recheck(at, len),
                     None => host.texture_slot_done(index, write, again),
                 }
                 continue;
@@ -3207,10 +3236,7 @@ impl State {
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             match memory {
                 // Whole and uploaded: looked at again (see above).
-                Some((at, len)) => {
-                    let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
-                }
+                Some((at, len)) => schedule_recheck(at, len),
                 None => host.texture_slot_done(index, write, again),
             }
         }
@@ -5162,7 +5188,21 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::staging_budget_per_frame;
+    use super::{next_texture_recheck, staging_budget_per_frame};
+
+    #[test]
+    fn only_previously_changed_textures_keep_the_final_recheck_interval() {
+        for changed in [false, true] {
+            assert_eq!(next_texture_recheck(0, changed), Some((1, 12)));
+            assert_eq!(next_texture_recheck(1, changed), Some((2, 40)));
+            assert_eq!(next_texture_recheck(2, changed), Some((3, 120)));
+            assert_eq!(next_texture_recheck(3, changed), Some((4, 400)));
+        }
+        assert_eq!(next_texture_recheck(4, false), None);
+        let (looks, wait) = next_texture_recheck(4, true).unwrap();
+        assert_eq!((looks, wait), (4, 400));
+        assert_eq!(next_texture_recheck(looks, true), Some((4, 400)));
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {
