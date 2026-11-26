@@ -1,0 +1,41 @@
+
+name: Build Victory
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        run: rustup show
+
+      - name: Compile Victory
+        run: cargo build --release --locked -p victory
+
+      - name: Package files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/target/release
+          Copy-Item target/release/victory.exe dist/target/release/
+          Copy-Item Play-VIctory.cmd dist/
+          Copy-Item Play-VIctory-4GB.cmd dist/
+          Copy-Item victory.example.toml dist/
+          Copy-Item LICENSE dist/
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: Victory-Windows-x64
+          path: dist/
+          if-no-files-found: error
