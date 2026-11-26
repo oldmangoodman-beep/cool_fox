@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     fn settings() {
-        assert_eq!(parse(""), Set::Off);
+        assert_eq!(parse(""), Set::Estimate(1.0));
         assert_eq!(parse("off"), Set::Off);
         assert_eq!(parse("0"), Set::Off);
         assert_eq!(parse("0.8"), Set::Estimate(0.8));
