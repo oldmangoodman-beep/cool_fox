@@ -267,10 +267,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     let age_at_request = p.made.get().is_none().then(|| p.created_at.elapsed().as_millis() as u64);
     if age_at_request.is_some() {
         start(p, REQUESTED);
-        if p.required_initialization {
+        if p.required_initialization || (p.graphics.is_none() && compute_waits()) {
             // OnceLock waits for a worker already compiling this pipeline,
             // or compiles it here if workers have not taken it yet. The
-            // ordinary shared frame budget cannot discard a one-time write.
+            // ordinary shared frame budget cannot discard a one-time write
+            // or a compute dispatch.
             p.make();
         } else {
             wait(p, crate::frame::current());
@@ -294,6 +295,26 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
             "persistent initialization pipeline resolved before its first dispatch");
     }
     p.made.get()?.as_ref()
+}
+
+/// Whether a dispatch waits for its compute pipeline until it is made,
+/// whatever the frame's budget ([`wait_budget`]); a draw still waits within
+/// the budget and is dropped while its pipeline is not there.
+///
+/// A dropped draw is drawn again in the next frame. A dropped dispatch may
+/// not be: the title runs some compute passes once, when a scene changes
+/// (a buffer reset or cleared), and what they leave is read for as long as
+/// the scene lasts. In the prison corridor a compute program met for the
+/// first time took 4.4 s to make on a 16 GB machine; its one dispatch was
+/// dropped after the half second of budget, and the windows of the room
+/// before stayed blended over the whole picture for minutes (run 195).
+/// A wait of seconds once (the pipeline library has it on the next run)
+/// against a picture wrong until the scene ends.
+/// On by default; `VICTORY_PIPELINE_COMPUTE_WAIT=0`: within the budget, as
+/// before.
+fn compute_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -723,8 +744,10 @@ mod tests {
         let p = Arc::new(p);
 
         assert!(!super::super::library::wanted_early(&p.key));
+        // A compute pipeline is made at once when dispatches wait for theirs
+        // (#1312, the default; it has no shaders here, so nothing comes of
+        // it); either way it is noted for the next launch.
         assert!(ready(&p).is_none());
-        assert!(p.made.get().is_none());
         assert!(super::super::library::wanted_early(&p.key));
     }
 
