@@ -12,6 +12,8 @@ thiserror.workspace = true
 zlib-rs.workspace = true
 
 [features]
+# Exports D3D12SDKVersion/D3D12SDKPath in test binaries for Windows 10 Agility SDK.
+agility-sdk = []
 # Host D3D12 pipeline checks (`emit::host`).
 host = ["dep:windows"]
 # Debugging switches (emitted-module dumps and the like).

@@ -619,6 +619,21 @@ impl Drop for Asking {
     }
 }
 
+/// Pages of write-watched memory asked about in one call, if asked in
+/// pieces: `VICTORY_WATCH_CHUNK_MB` (8 by default under Wine, whose answer
+/// holds its lock for all of memory; 0, and on Windows by default: one call
+/// for the whole range, as before).
+fn watch_chunk() -> Option<usize> {
+    static CHUNK: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        let mb = std::env::var("VICTORY_WATCH_CHUNK_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(if crate::host::under_wine() { 8 } else { 0 });
+        (mb > 0).then_some((mb << 20) / PAGE)
+    })
+}
+
 thread_local! {
     /// Room for the kernel's answer.
     static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -697,18 +712,37 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         let mut granularity = 0;
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
+        // Asked in pieces of at most `chunk` pages: Wine answers with its
+        // one lock for all of memory held, through the whole range (12 ms
+        // for some of the title's heaps), and every fault, protection change
+        // and question about memory of every thread waits behind it.
         let keep = no_reset();
-        // SAFETY: the answer buffer holds `count` entries.
-        let failed = unsafe {
-            GetWriteWatch(
-                if keep { 0 } else { WRITE_WATCH_FLAG_RESET },
-                (first * PAGE) as *const _,
-                (last - first) * PAGE,
-                found.as_mut_ptr().cast(),
-                &mut count,
-                &mut granularity,
-            )
-        } != 0;
+        let chunk = watch_chunk().unwrap_or(last - first).max(1);
+        let mut failed = false;
+        let mut filled = 0;
+        let mut from = first;
+        while from < last {
+            let to = (from + chunk).min(last);
+            let mut n = count - filled;
+            // SAFETY: the answer buffer holds `count` entries, `filled` of
+            // them used.
+            failed = unsafe {
+                GetWriteWatch(
+                    if keep { 0 } else { WRITE_WATCH_FLAG_RESET },
+                    (from * PAGE) as *const _,
+                    (to - from) * PAGE,
+                    found.as_mut_ptr().add(filled).cast(),
+                    &mut n,
+                    &mut granularity,
+                )
+            } != 0;
+            if failed {
+                break;
+            }
+            filled += n;
+            from = to;
+        }
+        count = filled;
         #[cfg(feature = "diagnostics")]
         {
             tally(10, u64::from(failed));
@@ -2075,42 +2109,34 @@ fn placeholder(block: usize) -> bool {
     if status >= 0 {
         return region.region_type & PLACEHOLDER_RESERVATION != 0;
     }
-    // Wine has no class 7 (and its class 6 says no kind): what the runtime
-    // reserved as placeholders for the title answers instead. Asked of Wine,
-    // no hole was ever known and every asking put a question to it for each
-    // of its holes, 12,900 a frame while the world streamed in; each one
-    // walks Wine's page table to the end of the reservation under its one
-    // lock, behind which the title's mapping and our guards' faults waited
-    // (frames of 0.5 to 6 s, 2026-11-26).
-    let at = block * BLOCK;
-    PLACEHOLDERS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .range(..=at)
-        .next_back()
-        .is_some_and(|(_, end)| at < *end)
+    // Wine answers this class with "unknown information class": what the
+    // runtime reserved as placeholders is known here instead
+    // ([`title_placeholder_reserved`]). Without it no hole was ever known,
+    // and each asking put a question to the system for every one, under
+    // Wine's one lock for all of memory (most of a frame's waits, run 6).
+    PLACEHOLDERS.read().unwrap_or_else(|e| e.into_inner()).range(..=block).next_back().is_some_and(|(_, &end)| block < end)
 }
 
-/// The placeholder reservations the runtime made for the title, start to end
-/// (for [`placeholder`] where the host cannot tell).
-static PLACEHOLDERS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+/// Placeholder reservations the runtime made, as blocks: start → end. Asked
+/// only where the system cannot say ([`placeholder`]).
+static PLACEHOLDERS: RwLock<BTreeMap<usize, usize>> = RwLock::new(BTreeMap::new());
 
-/// The runtime reserved `[at, at + len)` for the title as a placeholder,
-/// into which only views (or allocations) come.
+/// The runtime reserved `[at, at + len)` as a placeholder (`XMemVirtualAlloc`
+/// of 64 KiB pages): its holes are filled only by mapping views in place.
 pub fn title_placeholder_reserved(at: usize, len: usize) {
-    if len != 0 {
-        PLACEHOLDERS.lock().unwrap_or_else(|e| e.into_inner()).insert(at, at.saturating_add(len));
+    if len == 0 {
+        return;
     }
+    let (first, end) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    PLACEHOLDERS.write().unwrap_or_else(|e| e.into_inner()).insert(first, end);
 }
 
-/// The title frees `[at, at + len)` (no length: the allocation at `at`):
-/// no placeholder reservation there is known any more. One cut more than
-/// that is only asked of the host again.
-fn placeholders_freed(at: usize, len: usize) {
-    let end = if len == 0 { at + 1 } else { at.saturating_add(len) };
-    let mut p = PLACEHOLDERS.lock().unwrap_or_else(|e| e.into_inner());
-    let gone: Vec<usize> = p.range(..end).filter(|(_, e)| **e > at).map(|(s, _)| *s).collect();
-    for start in gone {
+/// What was noted of placeholders touching `[first, end)` is forgotten: the
+/// memory is given back, and may be any memory's next.
+fn placeholders_gone(first: usize, end: usize) {
+    let mut p = PLACEHOLDERS.write().unwrap_or_else(|e| e.into_inner());
+    let touching: Vec<usize> = p.range(..end).filter(|&(_, &e)| e > first).map(|(&s, _)| s).collect();
+    for start in touching {
         p.remove(&start);
     }
 }
@@ -3697,14 +3723,17 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
-    placeholders_freed(at, len);
     if len != 0 {
         forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     } else if VIEWS.any(at / BLOCK, at / BLOCK + 1) {
         forget_views(at / BLOCK, allocation_end(at, at).div_ceil(BLOCK).max(at / BLOCK + 1));
     }
-    let mut g = guards();
     let first = at / BLOCK;
+    // A release names no size: the whole of what holds `at` goes, so the
+    // placeholder noted around it is forgotten (asked about again, if a
+    // part of it stays).
+    placeholders_gone(first, if len == 0 { first + 1 } else { at.saturating_add(len).div_ceil(BLOCK) });
+    let mut g = guards();
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
     let Some(noted) = noted.into_iter().flatten().min() else {
         return;

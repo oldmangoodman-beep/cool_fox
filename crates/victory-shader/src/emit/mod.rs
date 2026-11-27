@@ -450,7 +450,24 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
 thread_local! {
     /// The hash-scoped wave policy for this thread's current translation.
     static WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The hash of the shader this thread translates ([`with_shader`]), named by the
+    /// `VICTORY_WAVE_WHY` lines: translations on several threads interleave them.
+    static SHADER: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
+
+/// `eprintln!` for the `VICTORY_WAVE_WHY` lines, with the shader's hash in front.
+macro_rules! wave_why {
+    ($($arg:tt)*) => {
+        $crate::emit::SHADER.with_borrow(|hash| {
+            if hash.is_empty() {
+                eprintln!($($arg)*)
+            } else {
+                eprintln!("[{hash}] {}", format_args!($($arg)*))
+            }
+        })
+    };
+}
+pub(crate) use wave_why;
 
 /// Uses the wave-wide form only for the named container hashes.
 pub fn wave_wide_only(hash: &str) -> bool {
@@ -468,15 +485,17 @@ pub fn wave_wide_only(hash: &str) -> bool {
     .any(|candidate| candidate.eq_ignore_ascii_case(hash))
 }
 
-/// Runs one translation with its own wave-wide policy on this thread.
-pub fn with_wave_wide<T>(on: bool, translate: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
+/// Runs the translation of the shader `hash` (16 hex digits) on this thread with its own
+/// wave-wide policy ([`wave_wide_only`]), its hash in front of the `VICTORY_WAVE_WHY` lines.
+pub fn with_shader<T>(hash: &str, translate: impl FnOnce() -> T) -> T {
+    struct Restore(bool, String);
     impl Drop for Restore {
         fn drop(&mut self) {
             WIDE_HERE.set(self.0);
+            SHADER.set(std::mem::take(&mut self.1));
         }
     }
-    let _restore = Restore(WIDE_HERE.replace(on));
+    let _restore = Restore(WIDE_HERE.replace(wave_wide_only(hash)), SHADER.replace(hash.to_owned()));
     translate()
 }
 
@@ -492,6 +511,42 @@ pub fn defrag_lds_sites() -> (u32, u32) {
 
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    let exact = emit_forms(c, native, p, st, io, res);
+    // A branch on a mask operation's SCC is the wave's ([`structure::Structured::wave_scc`],
+    // #66) and needs every lane where it stands. A program none of whose forms gives it that
+    // is taken with those branches split per lane, as before #66: inexact where an arm runs
+    // lanes whose own bit went the other way, but drawn. Dropped, its dispatch leaves what
+    // it writes unwritten, and the title read that back as a pointer: a write to 0 at
+    // +0x23cf683 loading the boat cutscene (#80) right after `ff6fdf23ce0b9048` failed so.
+    // `VICTORY_LANE_SPLIT=exact` refuses such a program instead.
+    let refused_wide = matches!(&exact,
+        Err(ShaderError::Unsupported { what, .. }) if *what == lower::WAVE_WIDE_ELSEWHERE);
+    if !refused_wide || st.wave_scc.is_empty() || std::env::var_os("VICTORY_LANE_SPLIT").is_some_and(|v| v == "exact") {
+        return exact;
+    }
+    let again = structure::with_per_lane(|| {
+        let st = structure::structure(p)?;
+        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+        emit_forms(c, native, p, &st, io, &res)
+    });
+    if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+        match &again {
+            Ok(_) => wave_why!("WAVE64-RETRY branches on a mask's SCC split per lane (inexact): translated"),
+            Err(e) => wave_why!("WAVE64-RETRY branches on a mask's SCC split per lane: {e}"),
+        }
+    }
+    // the exact form's refusal says more than the inexact one's
+    if again.is_err() { exact } else { again }
+}
+
+fn emit_forms(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
@@ -538,8 +593,8 @@ pub fn emit(
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
                 match r {
-                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
-                    Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
+                    Ok((_, wave)) => wave_why!("WAVE64-RETRY {what}: wave {wave:?}"),
+                    Err(e) => wave_why!("WAVE64-RETRY {what}: {e}"),
                 }
             }
         };
@@ -557,7 +612,7 @@ pub fn emit(
             Ok(()) => true,
             Err((offset, what)) => {
                 if why {
-                    eprintln!("WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}");
+                    wave_why!("WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}");
                 }
                 false
             }
@@ -567,7 +622,7 @@ pub fn emit(
         let form = |label: &str, p: Option<ir::Program>| {
             let Some(p) = p else {
                 if why {
-                    eprintln!("WAVE64-FORM {label}: ir returned None");
+                    wave_why!("WAVE64-FORM {label}: ir returned None");
                 }
                 return None;
             };
@@ -575,7 +630,7 @@ pub fn emit(
                 Ok(st) => st,
                 Err(e) => {
                     if why {
-                        eprintln!("WAVE64-FORM {label}: structure failed: {e}");
+                        wave_why!("WAVE64-FORM {label}: structure failed: {e}");
                     }
                     return None;
                 }
@@ -584,7 +639,7 @@ pub fn emit(
                 Ok(io) => io,
                 Err(e) => {
                     if why {
-                        eprintln!("WAVE64-FORM {label}: io::raise failed: {e}");
+                        wave_why!("WAVE64-FORM {label}: io::raise failed: {e}");
                     }
                     return None;
                 }
@@ -593,7 +648,7 @@ pub fn emit(
                 Ok(res) => res,
                 Err(e) => {
                     if why {
-                        eprintln!("WAVE64-FORM {label}: resource::track failed: {e}");
+                        wave_why!("WAVE64-FORM {label}: resource::track failed: {e}");
                     }
                     return None;
                 }
@@ -814,7 +869,7 @@ fn widen(
             if lower::half_meets() && cs.threads.iter().product::<u32>() == 128 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
-                eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
+                wave_why!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
             }
             return Err(NOT);
         }
@@ -850,7 +905,7 @@ fn widen(
                         format!("B{b}({nm}{})", if back { ",BACK" } else { "" })
                     })
                     .collect();
-                eprintln!("WAVE64-WIDE {} branches taken wave-wide: [{}]", wide.len(), desc.join(", "));
+                wave_why!("WAVE64-WIDE {} branches taken wave-wide: [{}]", wide.len(), desc.join(", "));
             }
             return r;
         }
@@ -861,7 +916,7 @@ fn widen(
             .collect();
         if more.is_empty() {
             if why {
-                eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
+                wave_why!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
             }
             return r;
         }
@@ -1160,6 +1215,17 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn a_translation_names_its_shader_and_the_name_is_restored_after() {
+        let named = || super::SHADER.with_borrow(Clone::clone);
+        super::with_shader("0123456789abcdef", || {
+            assert_eq!(named(), "0123456789abcdef");
+            super::with_shader("fedcba9876543210", || assert_eq!(named(), "fedcba9876543210"));
+            assert_eq!(named(), "0123456789abcdef");
+        });
+        assert_eq!(named(), "");
+    }
 
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
     /// is installed.

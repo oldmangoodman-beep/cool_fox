@@ -6,6 +6,8 @@
 //! (compiler options) and the zlib-compressed GFX10 code. The bitcode may use
 //! console-only intrinsics, so the GFX10 code is translated in general.
 
+#[cfg(all(test, windows, feature = "agility-sdk"))]
+mod agility_tests;
 pub mod bvh;
 pub mod dxbc;
 pub mod dxil;

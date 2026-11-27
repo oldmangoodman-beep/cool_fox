@@ -15,6 +15,8 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(all(test, windows, feature = "agility-sdk"))]
+mod agility_tests;
 #[cfg(windows)]
 mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -129,7 +131,6 @@ pub use inplace::{title_memory_freeing, title_memory_section, title_memory_secti
 #[cfg(windows)]
 pub use watch::{
     kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
-    title_placeholder_reserved,
-    title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
+    title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written, title_placeholder_reserved,
     writing as kernel_will_write,
 };

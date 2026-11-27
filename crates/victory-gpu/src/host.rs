@@ -94,6 +94,37 @@ enum Retired {
 // reference-counted wrappers holding them, dropped once.
 unsafe impl Send for Retired {}
 
+/// The card's budget we plan with, from the system's: `VICTORY_CARD_BUDGET_MB`
+/// if set (at most the system's), else under Wine the system's less 1 GiB.
+/// On Windows the system moves what does not fit to the PC's memory; on
+/// Linux nothing does, and what the desktop asks for next is refused: with
+/// the system's 6.2 GB budget on an 8 GB card the title went on to 7.7 GB
+/// of the card in all, and the desktop shell aborted for want of a surface.
+pub(crate) fn planned_card_budget(system: u64) -> u64 {
+    static ASKED: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
+        std::env::var("VICTORY_CARD_BUDGET_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map(|mb| mb << 20)
+    });
+    match asked {
+        Some(budget) => budget.min(system),
+        None if under_wine() => system.saturating_sub(1 << 30),
+        None => system,
+    }
+}
+
+/// Whether we run under Wine or Proton (its ntdll exports `wine_get_version`).
+pub fn under_wine() -> bool {
+    static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WINE.get_or_init(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: plain lookups in ntdll, always loaded.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    })
+}
+
 /// Milliseconds since the first call.
 pub(crate) fn now_ms() -> u64 {
     static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
@@ -497,7 +528,7 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
 /// were page faults in memory nothing of ours named any more, at no command
 /// in particular. Objects let go while nothing runs wait as well: lists
 /// recorded and not yet sent may name them. `VICTORY_BURY_LAG=0`: not.
-fn bury_lag() -> u64 {
+pub(crate) fn bury_lag() -> u64 {
     static LAG: OnceLock<u64> = OnceLock::new();
     *LAG.get_or_init(|| {
         let default = if crate::residency::limited_host_ram() { 16 } else { 64 };
@@ -3245,6 +3276,7 @@ struct Flight {
 }
 
 /// One thing in the line of what waits for the card, in order.
+#[allow(clippy::large_enum_variant)] // a few per submission; boxing buys nothing
 enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
@@ -3471,7 +3503,7 @@ fn blame_stale(stale: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) 
 /// title memory read, took `us`.
 #[cfg(feature = "diagnostics")]
 fn blamed(why: usize, us: u64) {
-    let (named, refused) = std::mem::replace(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()), (None, ""));
+    let (named, refused) = std::mem::take(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()));
     let (key, at) = match (why, named) {
         (WHY_READ | WHY_STALE, Some(named)) => named,
         (WHY_READ, None) => (("a host copy of what a copy done on the card wrote", refused, 0, 0, 0), 0),
@@ -4300,6 +4332,8 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+// Only the diagnostics build reports removed devices.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
@@ -7062,7 +7096,7 @@ impl HostList {
     /// as [`HostList::transition`] does a title resource's host copy, and
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
-    fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+    pub(crate) fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
         let wanted = legal_for(copy.flags(), wanted);
         self.changed_something();
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
@@ -8664,7 +8698,8 @@ enum Touch {
     Refresh(usize, usize, usize),
     /// The copy is given to shaders.
     Write(usize),
-    /// Title memory is written.
+    /// Title memory is written (made only by tests now).
+    #[cfg_attr(not(test), allow(dead_code))]
     Title,
     Nothing,
     /// Another part of the submission begins.
@@ -10425,7 +10460,7 @@ impl Host {
             );
             self.log_video_memory("right after that change");
         }
-        Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+        Some([planned_card_budget(own.Budget), own.CurrentUsage, shared.Budget, shared.CurrentUsage])
     }
 
     /// Both of the system's memory groups for this process, in bytes: for

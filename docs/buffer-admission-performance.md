@@ -26,8 +26,9 @@ The weight buffer could remain shared without the earlier slowdown.
 - Test the logical title length against the configured minimum. Continue
   charging the padded allocation size against the byte quota.
 - Keep up to one eighth of that quota, capped at 64 MiB, for later buffers
-  of at least 16 MiB. Ordinary copies use the rest; large copies first try
-  ordinary room, then reserved room. Both pools share the original total.
+  of at least 16 MiB. Large copies use any free ordinary room first and
+  charge only the remaining bytes to the reserve. Small copies use ordinary
+  room only. Both pools share the original total.
 - Preserve a single oversized copy that fits the total, small explicit
   quotas, the VRAM-pressure check, and the existing shared-memory fallback.
 - Account admission, allocation failure, and release consistently. Release

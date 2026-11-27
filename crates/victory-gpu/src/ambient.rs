@@ -49,7 +49,6 @@
 //! So about 1 should leave the clean run as it is and cut the veiled one to
 //! under half: an estimate to begin measuring from, not a measured value.
 
-use std::sync::atomic::AtomicU32;
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -464,14 +463,6 @@ const CELLS: u64 = 64 * 36;
 const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 
-/// Views of what the march clamp writes, a ring.
-/// shortcut: a view must last until its list has run, and nothing here
-/// waits for that: the ring is only long. The clamp takes up to 8 a frame,
-/// so 4,096 come round after about 500 frames, where 64 came round after 8;
-/// upgrade to slots retired by the list's fence if lists are ever held that
-/// long.
-const MARCH_VIEWS: u32 = 4096;
-
 struct Pass {
     root: ID3D12RootSignature,
     keep: ID3D12PipelineState,
@@ -480,15 +471,10 @@ struct Pass {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
-    /// The marched in-scatter's clamp (`VICTORY_AMBIENT_MARCH`) and its
-    /// views: made only with the switch on, and apart: a failure here
-    /// leaves the stand-in itself standing.
-    march: Option<(ID3D12PipelineState, ID3D12DescriptorHeap)>,
+    /// The optional clamp for the marched in-scatter.
+    march: Option<ID3D12PipelineState>,
     cells: ID3D12Resource,
     points: ID3D12Resource,
-    /// Bytes between the views of `march`'s heap, and the next of them.
-    step: u32,
-    next: AtomicU32,
 }
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Pass {}
@@ -530,21 +516,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
-    let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    let march = (march() > 0.0)
-        .then(|| -> windows::core::Result<_> {
-            let clamp = pipeline("MARCH", s!("clear_march"))?;
-            // SAFETY: plain heap creation.
-            let views: ID3D12DescriptorHeap = unsafe {
-                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: kind,
-                    NumDescriptors: MARCH_VIEWS,
-                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                    NodeMask: 0,
-                })?
-            };
-            Ok((clamp, views))
-        })
+    let march = (march() > 0.0).then(|| pipeline("MARCH", s!("clear_march")))
         .and_then(|made| made.inspect_err(|e| tracing::warn!(error = %e, "no clamp of the marched in-scatter")).ok());
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
@@ -558,9 +530,6 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         march,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
-        // SAFETY: a plain query.
-        step: unsafe { device.GetDescriptorHandleIncrementSize(kind) },
-        next: AtomicU32::new(0),
     })
 }
 
@@ -687,18 +656,18 @@ pub(crate) fn clear_march(list: &HostList, image: This) -> bool {
     let (Some(pass), Some(host)) = (pass(), host()) else {
         return false;
     };
-    let Some((clamp, views)) = &pass.march else {
+    let Some(clamp) = &pass.march else {
         return false;
     };
     // (The slow mean: none with the constant, none before a keeping.)
     if !matches!(set(), Set::Estimate(_)) || !KEPT.load(Ordering::Relaxed) {
         return false;
     }
-    let Some(texture) = crate::resource::host_resource(image) else {
+    let Some(copy) = crate::resource::host_copy(image) else {
         return false;
     };
     // SAFETY: a live resource.
-    let d = unsafe { texture.GetDesc() };
+    let d = unsafe { copy.texture.GetDesc() };
     // (R16G16B16A16_FLOAT.)
     if d.Format.0 != 10
         || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
@@ -710,34 +679,28 @@ pub(crate) fn clear_march(list: &HostList, image: This) -> bool {
         });
         return false;
     }
-    let view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-        Format: d.Format,
-        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
-        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_UAV { MipSlice: 0, PlaneSlice: 0 } },
+    let views = match copy.march_uav(&host.device) {
+        Ok(views) => views,
+        Err(e) => {
+            static WARN: std::sync::Once = std::sync::Once::new();
+            WARN.call_once(|| tracing::warn!(error = %e, "no UAV for the marched in-scatter"));
+            return false;
+        }
     };
     const WRITTEN: u32 = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
     const READ: u32 =
         (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0) as u32;
-    crate::list::ensure_state(list, image, WRITTEN);
-    list.keep(texture);
+    list.settle(&copy, WRITTEN);
     list.keep(&pass.cells);
     list.keep(&pass.points);
-    let slot = pass.next.fetch_add(1, Ordering::Relaxed) % MARCH_VIEWS;
     let mut words = [0u32; 11];
     words[10] = march().to_bits();
     let l = &list.list;
     // (The title's gathers before it wrote the image through other views.)
     uav_barrier(l);
-    // SAFETY: an open list; a slot of our heap; a live texture the list
-    // keeps, in the unordered-access state; buffers the list keeps.
+    // SAFETY: the list's texture state holds this exact copy and its immutable heap until reset.
     unsafe {
-        let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
-            ptr: views.GetCPUDescriptorHandleForHeapStart().ptr + (slot * pass.step) as usize,
-        };
-        let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: views.GetGPUDescriptorHandleForHeapStart().ptr + u64::from(slot * pass.step),
-        };
-        host.device.CreateUnorderedAccessView(texture, None::<&ID3D12Resource>, Some(&view), cpu);
+        let gpu = views.GetGPUDescriptorHandleForHeapStart();
         l.SetDescriptorHeaps(&[Some(views.clone())]);
         l.SetComputeRootSignature(&pass.root);
         l.SetComputeRoot32BitConstants(0, 11, words.as_ptr().cast(), 0);
@@ -748,7 +711,7 @@ pub(crate) fn clear_march(list: &HostList, image: This) -> bool {
         l.Dispatch((d.Width as u32).div_ceil(8), d.Height.div_ceil(8), 1);
     }
     uav_barrier(l);
-    crate::list::ensure_state(list, image, READ);
+    list.settle(&copy, READ);
     #[cfg(feature = "diagnostics")]
     {
         crate::capture::note_target(image);

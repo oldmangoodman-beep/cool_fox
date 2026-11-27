@@ -1048,6 +1048,15 @@ fn bindless_heaps_supported() -> bool {
             D3D12SerializeVersionedRootSignature(&desc, &mut blob, None).is_ok()
         };
         tracing::info!(ok, "bindless heap root signature flags probe");
+        if !ok {
+            // Windows 10's own D3D12 (issues #68, #69): the translated programs index the heaps
+            // directly, so their pipelines are refused (0x80070057) and the title stalls.
+            tracing::warn!(
+                "this D3D12 runtime has no shader model 6.6 bindless heaps (Windows 10?): pipelines \
+                 that index the heaps are refused. Build with `--features agility-sdk` and run \
+                 scripts\\get-agility-sdk.ps1 (see the README's build steps)"
+            );
+        }
         ok
     })
 }
@@ -1152,6 +1161,42 @@ mod tests {
         D3D12_SHADER_BYTECODE {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
+        }
+    }
+
+    /// A name the library does not have is `E_INVALIDARG`, the code the trail now calls
+    /// "not in it yet" (issue #70 read it as the library refusing the pipeline).
+    #[test]
+    fn a_name_the_library_lacks_is_invalid_arg() {
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let Ok(device) = host.device.cast::<ID3D12Device1>() else {
+            return;
+        };
+        let (root, _) = root_signature(&host.device, &[], &[], true).unwrap();
+        // SAFETY: an empty library (no blob at all, which every runtime takes), then a
+        // lookup of a name never stored with a description that names a live root signature.
+        unsafe {
+            let mut raw: *mut core::ffi::c_void = std::ptr::null_mut();
+            (Interface::vtable(&device).CreatePipelineLibrary)(
+                device.as_raw(),
+                std::ptr::null(),
+                0,
+                &ID3D12PipelineLibrary::IID,
+                &mut raw,
+            )
+            .ok()
+            .expect("an empty pipeline library");
+            let library = ID3D12PipelineLibrary::from_raw(raw);
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(root.clone())),
+                ..Default::default()
+            };
+            let got = library.LoadComputePipeline::<_, ID3D12PipelineState>(windows::core::w!("never stored"), &desc);
+            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+            assert_eq!(got.err().map(|e| e.code()), Some(windows::Win32::Foundation::E_INVALIDARG));
         }
     }
 
@@ -1272,14 +1317,17 @@ mod tests {
         let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
 
         let mut g = GraphicsState::default();
-        // Subobject 21 (`DEPTH_STENCIL1`) with `DepthBoundsTestEnable = true`,
-        // depth test itself off so only depth bounds gates the draw.
+        // Subobject 21 (`DEPTH_STENCIL1`) with `DepthBoundsTestEnable = true`
+        // and a depth test that always passes and writes nothing, so only
+        // depth bounds gates the draw. (With the depth test off, the draw
+        // outside the bounds passed on the CI runners' adapter, WARP,
+        // which seems to leave the whole depth stage out then.)
         #[repr(C, align(8))]
         struct Sub21(u32, D3D12_DEPTH_STENCIL_DESC1);
         let sub = Sub21(
             21,
             D3D12_DEPTH_STENCIL_DESC1 {
-                DepthEnable: false.into(),
+                DepthEnable: true.into(),
                 DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
                 DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
                 DepthBoundsTestEnable: true.into(),
