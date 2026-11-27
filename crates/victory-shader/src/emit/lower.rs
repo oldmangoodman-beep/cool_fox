@@ -4646,19 +4646,30 @@ impl<'a> Lower<'a> {
 
     /// A group barrier when every thread arrives, otherwise a meet of this console wave's two
     /// halves. A meet in a block a half does not run is refused: the wait would not finish.
-    fn order_waves(&mut self, block: usize, everyone: bool) -> usize {
+    fn order_waves(&mut self, block: usize, ir_block: Option<usize>) -> usize {
+        // A mask may first be read as a number in a later block. Its ballot and
+        // exchange run where it was defined. Every thread reaches the entry.
+        let everyone = ir_block.is_none_or(|b| self.group_all.get(b).copied().unwrap_or(false));
         // A meet or a group barrier ends a run of reads: the next access orders again.
         self.lds_run = None;
         let done = if !self.half_meet || everyone {
             #[cfg(test)]
-            self.group_sync_blocks.push(self.cur_ir);
+            self.group_sync_blocks.push(ir_block.unwrap_or(0));
             self.group_sync(block);
             block
-        } else if !self.both_halves(self.cur_ir) {
+        } else if let Some(b) = ir_block
+            && !self.both_halves(b)
+        {
             if self.meet_refuse.is_none() {
-                need(self.cur_ir);
+                need(b);
                 self.meet_refuse = Some("a half-meet where not every lane runs");
             }
+            block
+        } else if block != self.cur || self.s.m.is_terminated(block) {
+            // A per-wave wait splits the block and moves the lowering cursor.
+            // A deferred exchange cannot replace this predecessor's existing branch.
+            self.meet_refuse
+                .get_or_insert("a deferred exchange needs a per-wave meet in a closed block");
             block
         } else {
             self.half_meet_at(block)
@@ -4870,7 +4881,7 @@ impl<'a> Lower<'a> {
         let lds = self.s.lds();
         let ptr = self.s.m.element(at, lds, index);
         self.s.m.store(at, ptr, mine);
-        let at = self.order_waves(at, self.reached_by_group());
+        let at = self.order_waves(at, barrier_block);
         let one = self.s.m.i32(1);
         let k1 = self.s.m.bin(at, Bin::Add, pair, one);
         let p0 = self.s.m.element(at, lds, pair);
@@ -4878,7 +4889,7 @@ impl<'a> Lower<'a> {
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
         // the slots are written again only after every thread read them
-        let _at = self.order_waves(at, self.reached_by_group());
+        let _at = self.order_waves(at, barrier_block);
         Ok((lo, hi))
     }
 
@@ -6029,7 +6040,7 @@ impl<'a> Lower<'a> {
                         self.lds_reads += 1;
                     }
                 }
-                self.cur = self.order_waves(self.cur, self.reached_by_group());
+                self.cur = self.order_waves(self.cur, Some(self.cur_ir));
             }
             if self.half_meet {
                 self.lds_run = Some(write);
@@ -6068,7 +6079,7 @@ impl<'a> Lower<'a> {
                     if self.writes_uavs {
                         self.memory_fence();
                     }
-                    self.cur = self.order_waves(self.cur, false);
+                    self.cur = self.order_waves(self.cur, Some(self.cur_ir));
                 } else {
                     let mode = self.s.m.i32(mode);
                     let void = self.s.t.void;
@@ -6128,7 +6139,7 @@ impl<'a> Lower<'a> {
     /// The two host waves of a console wave meet (a group barrier with a shared-memory
     /// fence): LDS writes before are seen by reads after.
     fn lds_meeting(&mut self) {
-        self.cur = self.order_waves(self.cur, self.reached_by_group());
+        self.cur = self.order_waves(self.cur, Some(self.cur_ir));
     }
 
     /// Whether `v` is a register no program reads as a number: a descriptor dword without
@@ -9578,10 +9589,10 @@ impl<'a> Lower<'a> {
                     let ptr = self.s.m.element(self.cur, lds, k);
                     self.s.m.store(self.cur, ptr, a);
                     self.end_guarded(at, &[]);
-                    let c2 = self.order_waves(self.cur, self.reached_by_group());
+                    let c2 = self.order_waves(self.cur, Some(self.cur_ir));
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
-                    let _c2 = self.order_waves(c2, self.reached_by_group());
+                    let _c2 = self.order_waves(c2, Some(self.cur_ir));
                     return int(self, r);
                 }
                 let r = self.read_lane(a, lane);

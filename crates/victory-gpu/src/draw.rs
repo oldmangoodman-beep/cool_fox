@@ -589,9 +589,9 @@ pub(crate) struct State {
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
-    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// Root UAVs bound as one-view tables in this list, likewise.
-    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
@@ -1783,6 +1783,8 @@ impl State {
                 crate::picked::runs_in(list);
             }
             let made = self.tables_with_extents(list, &t.tables, compute, &extents);
+            #[cfg(feature = "diagnostics")]
+            self.trace_buffer_placement(&t.tables, compute, &stage.shader.hash);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -2480,7 +2482,10 @@ impl State {
         // frame has several, and together they get `bake_ms`.
         static BAKED_MS: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
-        let first = FRAME.swap(frame, Ordering::Relaxed) != frame;
+        // Looked at before it is swapped: every draw asks, on many threads,
+        // and only the first of a frame needs to write the shared line.
+        let first =
+            FRAME.load(Ordering::Relaxed) != frame && FRAME.swap(frame, Ordering::Relaxed) != frame;
         if first {
             BAKED_MS.store(0, Ordering::Relaxed);
         }
@@ -3332,6 +3337,7 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        self.march(list, p);
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -3385,6 +3391,42 @@ impl State {
         }
     }
 
+    /// Before a dispatch of `p` that reads the in-scatter marched along rays
+    /// (`crate::ambient::MARCH`), with `VICTORY_AMBIENT_MARCH` on: that image
+    /// held to the light of the room. Every such dispatch, not once a frame:
+    /// the clamp changes nothing the second time, and a frame may gather
+    /// twice. The list then has our heap, root signature and pipeline, so
+    /// `bind` sets the title's again.
+    fn march(&mut self, list: &HostList, p: &HostPipeline) {
+        use crate::ambient::{MARCH, Role};
+        let Some(s) = p.stages.first().filter(|s| s.shader.ambient == Some(Role::March)) else {
+            return;
+        };
+        if crate::ambient::march() == 0.0 || !crate::ambient::on() {
+            return;
+        }
+        let mut any = false;
+        for (slot, offset) in MARCH {
+            let reads = s.translated().used.iter().any(|u| {
+                u.kind == ResourceType::Srv && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+            });
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                continue;
+            };
+            if reads
+                && let Some(View::Shader(r, _)) = crate::descriptor::view(table + u64::from(offset) * 4)
+                && r != 0
+            {
+                any |= crate::ambient::clear_march(list, r as This);
+            }
+        }
+        if any {
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+            self.host_heaps_set = false;
+        }
+    }
+
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
@@ -3420,11 +3462,13 @@ impl State {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
+            // (Before its dispatch: `State::march`.)
+            Role::March => return false,
         };
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air => image,
+            Role::Radiance | Role::Air | Role::March => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
@@ -4162,6 +4206,43 @@ impl State {
         made
     }
 
+    /// Opt-in placement evidence for buffers a selected shader already bound.
+    /// Reports each view once; does not change allocation or synchronization.
+    #[cfg(feature = "diagnostics")]
+    fn trace_buffer_placement(&self, plan: &TablePlan, compute: bool, shader: &str) {
+        static PICKED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let picked = PICKED.get_or_init(|| std::env::var("VICTORY_TRACE_BUFFER_PLACEMENT")
+            .unwrap_or_default().split(',').map(|s| s.trim().to_ascii_lowercase()).collect());
+        if !picked.iter().any(|s| s == shader) {
+            return;
+        }
+        static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(String, u64, u64)>>> =
+            std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        for group in &plan.groups {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(group.slot)) else { continue };
+            for used in &group.entries {
+                let handle = table + u64::from(used.table_offset_dwords) * 4;
+                let Some(view) = crate::descriptor::view(handle) else { continue };
+                let Some((shadow, address, bytes)) = crate::descriptor::host::buffer_copy(&view) else { continue };
+                if !SEEN.lock().unwrap_or_else(|e| e.into_inner()).insert((shader.to_owned(), address, bytes)) {
+                    continue;
+                }
+                let mut heap = D3D12_HEAP_PROPERTIES::default();
+                let mut flags = D3D12_HEAP_FLAGS::default();
+                // SAFETY: a live resource whose placement is queried only.
+                let queried = unsafe { shadow.buffer.GetHeapProperties(Some(&mut heap), Some(&mut flags)) }.is_ok();
+                let (start, span) = shadow.span();
+                tracing::info!(shader, kind = ?used.kind, slot = group.slot,
+                    address = format_args!("{address:#x}"), bytes,
+                    copy_start = format_args!("{start:#x}"), copy_bytes = span,
+                    carded = shadow.carded(), in_place = shadow.in_place(), queried,
+                    heap_type = heap.Type.0, cpu_page = heap.CPUPageProperty.0,
+                    memory_pool = heap.MemoryPoolPreference.0,
+                    "selected shader buffer placement");
+            }
+        }
+    }
+
     /// The first draws, at debug level: what they bind and read
     /// (diagnostics builds).
     #[cfg(feature = "diagnostics")]
@@ -4642,6 +4723,8 @@ impl State {
                 (bounded, 0)
             }
         };
+        // (After the clamp of the arguments, which has its own pipeline.)
+        self.march(list, p);
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),

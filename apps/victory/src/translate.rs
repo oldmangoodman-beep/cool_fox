@@ -423,16 +423,22 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
                             if !lock(&seen).insert(hash) {
                                 continue;
                             }
-                            match victory_hle::modules::d3d12x::precompile(&bytes) {
-                                Ok(_) => {
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                victory_hle::modules::d3d12x::precompile(&bytes)
+                            })) {
+                                Ok(Ok(_)) => {
                                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                                     if n.is_multiple_of(1000) {
                                         println!("{n} shaders in the cache, {:.0} s", started.elapsed().as_secs_f64());
                                     }
                                 }
-                                Err(why) => {
+                                Ok(Err(why)) => {
                                     let mut failed = lock(&failed);
                                     failed.entry(why).or_insert_with(|| (0, hash.to_hex()[..16].to_owned())).0 += 1;
+                                }
+                                Err(_) => {
+                                    let mut failed = lock(&failed);
+                                    failed.entry("translation panicked".into()).or_insert_with(|| (0, hash.to_hex()[..16].to_owned())).0 += 1;
                                 }
                             }
                         }

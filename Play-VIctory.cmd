@@ -44,8 +44,12 @@ rem skin of people in play is not drawn (eyes and teeth are), and JOIN_PARTS
 rem repeats frames of the opening video. Set them to 1 to try instead.
 if not defined VICTORY_THIN set "VICTORY_THIN=0"
 if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=0"
-rem Renderer ports 1 & 5 stay opt-in: on 8 GB NVIDIA cards PORT_CBV=1 can drop
-rem road surfaces and PORT_CONSTANTS+PORT_CBV can raise a C++ exception (#15).
+rem Renderer ports 6 & 7 (write-guard lock sharing, journal split) save 2-5 ms
+rem per frame and are safe on every tested GPU. Ports 1 & 5 stay opt-in: on
+rem 8 GB NVIDIA cards PORT_CBV=1 can drop road surfaces and
+rem PORT_CONSTANTS+PORT_CBV can raise a C++ exception (#15).
+if not defined VICTORY_PORT_GUARD set "VICTORY_PORT_GUARD=1"
+if not defined VICTORY_PORT_JOURNAL set "VICTORY_PORT_JOURNAL=1"
 if not defined VICTORY_PORT_CONSTANTS set "VICTORY_PORT_CONSTANTS=0"
 if not defined VICTORY_PORT_CBV set "VICTORY_PORT_CBV=0"
 if not defined VICTORY_LIBRARY_STORE_LATER set "VICTORY_LIBRARY_STORE_LATER=1"

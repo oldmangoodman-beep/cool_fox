@@ -58,6 +58,9 @@ pub(crate) struct Pending {
     required_initialization: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
+    /// The frame a draw first waited for it, plus one; 0: never waited
+    /// ([`wait_again_budget`]).
+    first_wait: AtomicU64,
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
@@ -151,6 +154,7 @@ impl Pending {
             used: AtomicBool::new(false),
             reported_pending: AtomicBool::new(false),
             created_at: Instant::now(),
+            first_wait: AtomicU64::new(0),
         }
     }
 
@@ -184,13 +188,13 @@ impl Pending {
     }
 }
 
-/// Why a pipeline has no host pipeline (diagnostics): its shaders that do
-/// not translate, else "refused" or "being made"; `None` if it has one.
+/// Explain a missing host pipeline, including passes skipped before queueing.
+/// A completed host pipeline has no missing reason.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some("being made".into()),
+        None => Some(p.left_out.unwrap_or("being made").to_owned()),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
@@ -237,6 +241,32 @@ fn screen_budget() -> Duration {
         let millis = std::env::var("VICTORY_SCREEN_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(10_000);
         Duration::from_millis(millis)
     })
+}
+
+/// What a pipeline still being made may take of a frame's budget after the
+/// first frame that waited for it (`VICTORY_PIPELINE_WAIT_AGAIN_MS`; unset:
+/// [`wait_budget`] every frame, as before). The budget is a frame's, so one
+/// 3.4 s compile cost about seven frames of half a second each; with this a
+/// draw whose pipeline is not made by then is dropped sooner (it pops in
+/// later) instead of holding up each frame. Not for passes over the screen.
+fn wait_again_budget() -> Option<Duration> {
+    static BUDGET: OnceLock<Option<Duration>> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let millis = std::env::var("VICTORY_PIPELINE_WAIT_AGAIN_MS").ok()?.trim().parse::<u64>().ok()?;
+        tracing::info!(millis, "host pipeline wait budget after its first frame");
+        Some(Duration::from_millis(millis))
+    })
+}
+
+/// The most a pipeline may wait in frame `frame`: `full` in the first frame
+/// that waited for it (`first_wait` is that frame plus one, 0 if none),
+/// `again` in later ones.
+fn budget_for(first_wait: u64, frame: u64, full: Duration, again: Option<Duration>) -> Duration {
+    if first_wait == 0 || first_wait == frame.wrapping_add(1) {
+        full
+    } else {
+        again.unwrap_or(full)
+    }
 }
 
 /// Whether passes over the screen go before the others.
@@ -364,13 +394,25 @@ fn wait(p: &Pending, frame: u64) {
     // taken by a thread waiting now); of the passes over the screen too.
     static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
     let spent_of = &SPENT[usize::from(screen)];
+    let again = if screen { None } else { wait_again_budget() };
     let shared = shared_budget();
     let left = {
         let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1);
+        let mut left = budget.saturating_sub(spent.1);
+        // Marked only when it may wait, so one dropped without waiting has
+        // its full budget the next frame. Up to five recording threads may
+        // wait for it at once. Only what is taken here is given back below.
+        if let Some(again) = again.filter(|_| !left.is_zero()) {
+            let mine = frame.wrapping_add(1);
+            let first = match p.first_wait.compare_exchange(0, mine, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => mine,
+                Err(first) => first,
+            };
+            left = left.min(budget_for(first, frame, budget, Some(again)));
+        }
         if shared {
             spent.1 += left;
         }
@@ -656,6 +698,18 @@ mod tests {
         assert!(!pending("compute", b"CS_PedStandardSkinning_0").required_initialization);
     }
 
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn an_intentionally_skipped_pipeline_reports_its_reason() {
+        let mut pending = Pending::new(Vec::new(), None);
+        assert_eq!(missing(&pending).as_deref(), Some("being made"));
+        pending.left_out = Some("sample pass disabled");
+        let pending = Arc::new(pending);
+        assert!(ready(&pending).is_none());
+        assert_eq!(pending.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert_eq!(missing(&pending).as_deref(), pending.left_out);
+    }
+
     #[test]
     fn first_initialization_dispatch_waits_for_the_compiler_past_the_frame_budget() {
         let mut p = Pending::new(Vec::new(), None);
@@ -792,6 +846,18 @@ mod tests {
         queue.slow_now -= 1;
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &longer));
         assert!(queue.pop(false, 1).is_none());
+    }
+
+    /// A pipeline still being made waits the full budget in the first frame
+    /// that waits for it, and `VICTORY_PIPELINE_WAIT_AGAIN_MS` in later ones.
+    #[test]
+    fn later_frames_wait_the_again_budget() {
+        let full = Duration::from_millis(500);
+        let again = Some(Duration::from_millis(8));
+        assert_eq!(budget_for(0, 7, full, again), full);
+        assert_eq!(budget_for(8, 7, full, again), full);
+        assert_eq!(budget_for(8, 9, full, again), Duration::from_millis(8));
+        assert_eq!(budget_for(8, 9, full, None), full);
     }
 
     /// Passes over the screen go before all others, and workers of their own

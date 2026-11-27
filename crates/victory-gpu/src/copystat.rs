@@ -88,6 +88,9 @@ pub(crate) enum C {
     /// Texture uploads recorded, and left out as unchanged.
     TexUploads,
     TexSkipped,
+    /// Texture staging buffers detiled while an earlier submission that
+    /// copies from them may not have run yet (`texture::in_air`).
+    TexInAir,
     /// Held submissions a present ran although their waits were not met.
     Forced,
     /// Ranges named through unordered access views by shaders that cannot
@@ -1238,7 +1241,8 @@ pub(crate) fn log(frames: f64) {
          until the first submission; {:.1} ms from the last submission to the present call; \
          lists reset in {:.1} ms; the process ran {user:.0} ms user + {kernel:.0} ms kernel on \
          all threads; what shaders wrote: {:.1} ms finding {:.0} pieces that differ, {:.1} ms \
-         putting them back; texture uploads: {:.0} recorded, {:.0} left out; {:.1} held \
+         putting them back; texture uploads: {:.0} recorded, {:.0} left out, {:.1} detiled \
+         while one was in the air; {:.1} held \
          submissions run at the present with their waits not met; waits for memory values: \
          {:.0} looks {:.1} ms; {:.0} host lists made {:.1} ms; {:.0} parts of held submissions \
          ran alone that the next part could have run with",
@@ -1251,6 +1255,7 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::BackSyncUs as usize]),
         c[C::TexUploads as usize],
         c[C::TexSkipped as usize],
+        c[C::TexInAir as usize],
         c[C::Forced as usize],
         c[C::WaitChecks as usize],
         c[C::WaitCheckNs as usize] / 1e6,

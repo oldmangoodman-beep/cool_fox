@@ -977,3 +977,156 @@ fn a_parked_pair_another_save_or_restore_shares_stays_two_scalars() {
         assert!(!instructions(&p, "s_mov_b32").is_empty(), "{name}");
     }
 }
+
+/// A mask is produced before a wave-wide branch and read as a number inside it.
+/// The store uses a register written in the body before the deferred ballot.
+fn deferred_ballot(outer_branch: bool) -> Result<HostShader, ShaderError> {
+    let body = [
+        0x340A_0082, // v_lshlrev_b32 v5, 2, v0
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE90_046A, // s_mov_b64 s[16:17], vcc
+        0x7D88_0001, // v_cmp_gt_u32 vcc, s1, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0005, // s_cbranch_execz to the restore
+        0x4A08_0001, // v_add_nc_u32 v4, s1, v0
+        0x7E06_0210, // v_mov_b32 v3, s16
+        0x4A06_0903, // v_add_nc_u32 v3, v3, v4
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 3 << 8 | 5, // buffer_store_dword v3, v5, s[8:11], 0 offen
+        0xBEFE_040C,                       // s_mov_b64 exec, s[12:13]
+    ];
+    let mut words = Vec::new();
+    if outer_branch {
+        words.extend([
+            0x7D88_0002,                     // v_cmp_gt_u32 vcc, s2, v0
+            0xBE8E_246A,                     // s_and_saveexec_b64 s[14:15], vcc
+            0xBF88_0000 | body.len() as u32, // s_cbranch_execz to the outer restore
+        ]);
+    }
+    words.extend(body);
+    if outer_branch {
+        words.push(0xBEFE_040E); // s_mov_b64 exec, s[14:15]
+    }
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let wide = p
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.insts.iter().any(|i| i.name() == "s_cbranch_execz"))
+        .map(|(b, _)| b)
+        .collect();
+    lower::with_half_meets(|| lowered(&native, &p, &wide))
+}
+
+#[test]
+fn a_mask_ballot_in_a_uniform_predecessor_keeps_its_branch() {
+    let mut shader = deferred_ballot(false).expect("uniform mask definition");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil)
+            .expect("valid DXIL for the saved mask");
+    }
+}
+
+#[test]
+fn a_deferred_ballot_in_a_wave_only_predecessor_is_refused() {
+    let Err(ShaderError::Unsupported { what, .. }) = deferred_ballot(true) else {
+        panic!("a closed predecessor reached by only part of the group needs a per-wave meet");
+    };
+    assert_eq!(
+        what,
+        "a deferred exchange needs a per-wave meet in a closed block"
+    );
+}
+
+#[test]
+fn a_saved_mask_reaches_each_active_lane() {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::*;
+
+    let shader = deferred_ballot(false).expect("uniform mask definition");
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 device; 0 lane comparisons");
+        return;
+    };
+    let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: the LUID is the selected device's and caps is the OPTIONS1 output.
+    let adapter = unsafe {
+        host.device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut caps).cast(),
+                size_of_val(&caps) as u32,
+            )
+            .expect("wave capabilities");
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid()))
+            .and_then(|a| a.GetDesc1())
+            .expect("selected adapter")
+            .Description
+    };
+    let name = String::from_utf16_lossy(
+        &adapter[..adapter
+            .iter()
+            .position(|&w| w == 0)
+            .unwrap_or(adapter.len())],
+    );
+    if !caps.WaveOps.as_bool() || !(caps.WaveLaneCountMin..=caps.WaveLaneCountMax).contains(&32) {
+        eprintln!(
+            "{name}: Wave{}..{}, 0 Wave32 lane comparisons",
+            caps.WaveLaneCountMin, caps.WaveLaneCountMax
+        );
+        return;
+    }
+    let (root, pso) = host
+        .compute_pipeline(&shader)
+        .expect("Wave32 compute pipeline");
+    assert_eq!(shader.root_uavs, [super::SLOT_MEET]);
+    assert!(shader.root_cbvs.is_empty() && shader.root_srvs.is_empty());
+    let mut comparisons = 0;
+    for (mask_limit, active_limit) in [(0u32, 0u32), (5, 23), (20, 64), (68, 87), (96, 128)] {
+        let constants = [mask_limit, active_limit];
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = constants[d as usize];
+            }
+        }
+        let output = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud)), (1, Root::Uav(1))],
+                    views: &[View::RawUav(128), View::RawUav(3)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("128-thread dispatch");
+        let expected: Vec<u32> = (0..128)
+            .map(|thread| {
+                let low_lanes = mask_limit.saturating_sub(thread / 64 * 64).min(32);
+                let low_mask = ((1u64 << low_lanes) - 1) as u32;
+                if thread < active_limit {
+                    low_mask.wrapping_add(thread + active_limit)
+                } else {
+                    0
+                }
+            })
+            .collect();
+        assert_eq!(
+            output[1], [0; 3],
+            "all exchanges are in the uniform predecessor"
+        );
+        assert_eq!(
+            output[0], expected,
+            "{name}, mask<{mask_limit}, active<{active_limit}"
+        );
+        comparisons += expected.len();
+    }
+    eprintln!("{name}: {comparisons} Wave32 lane comparisons passed");
+}
